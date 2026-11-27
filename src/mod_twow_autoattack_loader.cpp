@@ -17,8 +17,10 @@
 #include "WorldPacket.h"
 #include "WorldSession.h"
 
+#include <array>
 #include <atomic>
 #include <cctype>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -38,6 +40,8 @@ constexpr uint32 Throw = 2764;
 constexpr uint32 RetryMs = 500;
 constexpr uint32 TransientRetryMs = 125;
 constexpr uint32 TransitionMs = 100;
+constexpr size_t ShardCount = 32;
+constexpr float MoveResetDistSq = 0.09f; // 0.3 yd movement invalidates geometry backoff
 
 struct PendingShot
 {
@@ -45,6 +49,12 @@ struct PendingShot
     Spell const* previous;
     uint32 spellId;
     CurrentSpellTypes slot;
+
+    bool operator==(PendingShot const& other) const
+    {
+        return target == other.target && previous == other.previous &&
+            spellId == other.spellId && slot == other.slot;
+    }
 };
 
 struct Intent
@@ -57,22 +67,148 @@ struct Intent
     uint32 transition = 0;
     SpellCastResult lastFailure = SPELL_CAST_OK;
     bool ranged = false;
+    bool hasFailPos = false;
+    float failPlayerX = 0.0f;
+    float failPlayerY = 0.0f;
+    float failPlayerZ = 0.0f;
+    float failTargetX = 0.0f;
+    float failTargetY = 0.0f;
+    float failTargetZ = 0.0f;
     std::optional<PendingShot> pending;
+
+    bool operator==(Intent const& other) const
+    {
+        return target == other.target && shot == other.shot && shotId == other.shotId &&
+            slot == other.slot && retry == other.retry && transition == other.transition &&
+            lastFailure == other.lastFailure && ranged == other.ranged &&
+            hasFailPos == other.hasFailPos &&
+            (!hasFailPos || (failPlayerX == other.failPlayerX && failPlayerY == other.failPlayerY &&
+                failPlayerZ == other.failPlayerZ && failTargetX == other.failTargetX &&
+                failTargetY == other.failTargetY && failTargetZ == other.failTargetZ)) &&
+            pending == other.pending;
+    }
+
+    bool operator!=(Intent const& other) const { return !(*this == other); }
+};
+
+struct Shard
+{
+    std::mutex mutex;
+    std::atomic<uint32> intentCount{0};
+    std::unordered_map<uint32, Intent> intents;
+    std::unordered_set<uint32> rangedDisabled;
+    std::unordered_map<uint32, bool> meleePreferences;
 };
 
 std::atomic<bool> enabled{false};
 std::atomic<bool> preferencesAvailable{false};
 std::atomic<bool> meleePreferencesAvailable{false};
-bool debug = false;
-uint32 debugGuid = 0;
-bool rightClick = true;
-bool defaultPreferMelee = true;
-bool announce = false;
-bool stopOnTargetChange = true;
-std::mutex intentsMutex;
-std::unordered_map<uint32, Intent> intents;
-std::unordered_set<uint32> rangedDisabled;
-std::unordered_map<uint32, bool> meleePreferences;
+std::atomic<uint32> totalActiveIntents{0};
+std::atomic<bool> debug{false};
+std::atomic<uint32> debugGuid{0};
+std::atomic<bool> rightClick{true};
+std::atomic<bool> defaultPreferMelee{true};
+std::atomic<bool> announce{false};
+std::atomic<bool> stopOnTargetChange{true};
+std::array<Shard, ShardCount> shards;
+
+Shard& ShardFor(uint32 guid)
+{
+    return shards[guid & (ShardCount - 1)];
+}
+
+bool HasAnyActiveIntent()
+{
+    return totalActiveIntents.load(std::memory_order_acquire) != 0;
+}
+
+bool ShardHasActiveIntent(Shard const& shard)
+{
+    return shard.intentCount.load(std::memory_order_acquire) != 0;
+}
+
+void UpsertIntentLocked(Shard& shard, uint32 guid, Intent const& intent)
+{
+    auto [it, inserted] = shard.intents.insert_or_assign(guid, intent);
+    (void)it;
+    if (inserted)
+    {
+        shard.intentCount.fetch_add(1, std::memory_order_release);
+        totalActiveIntents.fetch_add(1, std::memory_order_release);
+    }
+}
+
+bool EraseIntentLocked(Shard& shard, uint32 guid, Intent* removed = nullptr)
+{
+    auto const found = shard.intents.find(guid);
+    if (found == shard.intents.end())
+        return false;
+    if (removed)
+        *removed = found->second;
+    shard.intents.erase(found);
+    shard.intentCount.fetch_sub(1, std::memory_order_release);
+    totalActiveIntents.fetch_sub(1, std::memory_order_release);
+    return true;
+}
+
+bool IsSupportedShotSpell(uint32 spellId)
+{
+    switch (spellId)
+    {
+        case AutoShot:
+        case WandShoot:
+        case ShootBow:
+        case ShootGun:
+        case ShootCrossbow:
+        case Throw:
+            return true;
+        default:
+            return false;
+    }
+}
+
+template <typename T>
+bool PeekPacketValue(WorldPacket const& packet, T& out)
+{
+    size_t const pos = packet.rpos();
+    if (pos > packet.size() || sizeof(T) > packet.size() - pos)
+        return false;
+    out = packet.read<T>(pos);
+    return true;
+}
+
+bool EqualsIgnoreCase(char const* lhs, char const* rhs)
+{
+    if (!lhs || !rhs)
+        return false;
+    while (*lhs && *rhs)
+    {
+        if (std::tolower(static_cast<unsigned char>(*lhs)) !=
+            std::tolower(static_cast<unsigned char>(*rhs)))
+            return false;
+        ++lhs;
+        ++rhs;
+    }
+    return *lhs == '\0' && *rhs == '\0';
+}
+
+void EnsureRangedSheath(Player* player, bool forceUpdate = false)
+{
+    bool const changed = player->GetSheath() != SHEATH_STATE_RANGED;
+    if (changed)
+        player->SetSheath(SHEATH_STATE_RANGED);
+    if (changed || forceUpdate)
+        player->DirectSendPublicValueUpdate({UNIT_FIELD_BYTES_2});
+}
+
+void EnsureMeleeSheath(Player* player, bool immediate = false)
+{
+    bool const changed = player->GetSheath() != SHEATH_STATE_MELEE;
+    if (changed)
+        player->SetSheath(SHEATH_STATE_MELEE);
+    if (changed || immediate)
+        player->DirectSendPublicValueUpdate({UNIT_FIELD_BYTES_2});
+}
 
 void Trace(Player* player, ObjectGuid target, char const* event, uint32 spellId = 0, uint32 result = 0)
 {
@@ -89,26 +225,39 @@ std::string Lowercase(std::string text)
     return text;
 }
 
+bool PreferMeleeLocked(Shard const& shard, uint32 guid)
+{
+    auto const found = shard.meleePreferences.find(guid);
+    return found == shard.meleePreferences.end() ? defaultPreferMelee.load(std::memory_order_relaxed) : found->second;
+}
+
+bool RangedEnabledLocked(Shard const& shard, uint32 guid)
+{
+    return shard.rangedDisabled.count(guid) == 0;
+}
+
 bool PreferMelee(uint32 guid)
 {
-    std::lock_guard<std::mutex> lock(intentsMutex);
-    auto const found = meleePreferences.find(guid);
-    return found == meleePreferences.end() ? defaultPreferMelee : found->second;
+    Shard& shard = ShardFor(guid);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    return PreferMeleeLocked(shard, guid);
 }
 
 bool RangedEnabled(uint32 guid)
 {
-    std::lock_guard<std::mutex> lock(intentsMutex);
-    return rangedDisabled.count(guid) == 0;
+    Shard& shard = ShardFor(guid);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    return RangedEnabledLocked(shard, guid);
 }
 
 void CacheRangedPreference(uint32 guid, bool ranged)
 {
-    std::lock_guard<std::mutex> lock(intentsMutex);
+    Shard& shard = ShardFor(guid);
+    std::lock_guard<std::mutex> lock(shard.mutex);
     if (ranged)
-        rangedDisabled.erase(guid);
+        shard.rangedDisabled.erase(guid);
     else
-        rangedDisabled.insert(guid);
+        shard.rangedDisabled.insert(guid);
 }
 
 bool Eligible(Player* player)
@@ -148,18 +297,8 @@ void StopRangedVictim(Player* player, ObjectGuid target)
         player->AttackStop();
 }
 
-void Forget(Player* player, bool interrupt, char const* reason = "intent cleared", bool stopRangedVictim = false)
+void CleanupForgottenIntent(Player* player, Intent const& intent, bool interrupt, char const* reason, bool stopRangedVictim)
 {
-    Intent intent;
-    {
-        std::lock_guard<std::mutex> lock(intentsMutex);
-        auto const found = intents.find(player->GetGUIDLow());
-        if (found == intents.end())
-            return;
-        intent = found->second;
-        intents.erase(found);
-    }
-
     Trace(player, intent.target, reason, intent.shotId);
     if (interrupt && player->IsInWorld())
     {
@@ -173,6 +312,30 @@ void Forget(Player* player, bool interrupt, char const* reason = "intent cleared
     // chosen server victim belongs to the core.
     if (stopRangedVictim && intent.ranged && player->IsInWorld())
         StopRangedVictim(player, intent.target);
+    if (intent.ranged && player->IsInWorld() &&
+        player->HasUnitState(UNIT_STAT_MELEE_ATTACKING) &&
+        player->GetSheath() == SHEATH_STATE_RANGED)
+        EnsureMeleeSheath(player, true);
+}
+
+void Forget(Player* player, bool interrupt, char const* reason = "intent cleared", bool stopRangedVictim = false)
+{
+    if (!HasAnyActiveIntent())
+        return;
+
+    uint32 const guid = player->GetGUIDLow();
+    Shard& shard = ShardFor(guid);
+    if (!ShardHasActiveIntent(shard))
+        return;
+
+    Intent intent;
+    {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        if (!EraseIntentLocked(shard, guid, &intent))
+            return;
+    }
+
+    CleanupForgottenIntent(player, intent, interrupt, reason, stopRangedVictim);
 }
 
 bool ValidTarget(Player* player, Unit* target)
@@ -213,7 +376,9 @@ void AdoptPendingShot(Player* player, Intent& intent)
     intent.retry = 0;
     intent.transition = 0;
     intent.lastFailure = SPELL_CAST_OK;
+    intent.hasFailPos = false;
     intent.ranged = true;
+    EnsureRangedSheath(player);
     Trace(player, intent.target, "native ranged cast adopted", intent.shotId);
 }
 
@@ -300,32 +465,106 @@ SpellCastResult CheckShotGeometry(Player* player, Unit* target, SpellEntry const
     return SPELL_CAST_OK;
 }
 
+bool MovedSinceFailure(Player* player, Unit* target, Intent const& intent)
+{
+    if (intent.lastFailure == SPELL_FAILED_UNIT_NOT_INFRONT && player->IsFacingTarget(target))
+        return true;
+
+    float const pdx = player->GetPositionX() - intent.failPlayerX;
+    float const pdy = player->GetPositionY() - intent.failPlayerY;
+    float const pdz = player->GetPositionZ() - intent.failPlayerZ;
+    if (pdx * pdx + pdy * pdy + pdz * pdz > MoveResetDistSq)
+        return true;
+
+    float const tdx = target->GetPositionX() - intent.failTargetX;
+    float const tdy = target->GetPositionY() - intent.failTargetY;
+    float const tdz = target->GetPositionZ() - intent.failTargetZ;
+    return tdx * tdx + tdy * tdy + tdz * tdz > MoveResetDistSq;
+}
+
 class Settings final : public WorldScript
 {
 public:
-    Settings() : WorldScript("TwowAutoAttackSettings", {WORLDHOOK_ON_STARTUP}) {}
+    Settings() : WorldScript("TwowAutoAttackSettings", {WORLDHOOK_ON_STARTUP, WORLDHOOK_ON_AFTER_CONFIG_LOAD}) {}
+
+    void LoadRuntimeConfig()
+    {
+        debug.store(sConfig.GetBoolDefault("TwowAutoAttack.Debug", false), std::memory_order_relaxed);
+        int32 const filter = sConfig.GetIntDefault("TwowAutoAttack.Debug.PlayerGuid", 0);
+        debugGuid.store(filter > 0 ? uint32(filter) : 0, std::memory_order_relaxed);
+        rightClick.store(sConfig.GetBoolDefault("TwowAutoAttack.RightClick", true), std::memory_order_relaxed);
+        defaultPreferMelee.store(sConfig.GetBoolDefault("TwowAutoAttack.CloseRange.Melee", true), std::memory_order_relaxed);
+        announce.store(sConfig.GetBoolDefault("TwowAutoAttack.Announce", false), std::memory_order_relaxed);
+        stopOnTargetChange.store(sConfig.GetBoolDefault("TwowAutoAttack.StopOnTargetChange", true), std::memory_order_relaxed);
+    }
+
+    void OnAfterConfigLoad(bool reload) override
+    {
+        if (reload)
+            LoadRuntimeConfig();
+    }
 
     void OnStartup() override
     {
-        debug = sConfig.GetBoolDefault("TwowAutoAttack.Debug", false);
-        int32 const filter = sConfig.GetIntDefault("TwowAutoAttack.Debug.PlayerGuid", 0);
-        debugGuid = filter > 0 ? uint32(filter) : 0;
-        rightClick = sConfig.GetBoolDefault("TwowAutoAttack.RightClick", true);
-        defaultPreferMelee = sConfig.GetBoolDefault("TwowAutoAttack.CloseRange.Melee", true);
-        announce = sConfig.GetBoolDefault("TwowAutoAttack.Announce", false);
-        stopOnTargetChange = sConfig.GetBoolDefault("TwowAutoAttack.StopOnTargetChange", true);
-        enabled = sConfig.GetBoolDefault("TwowAutoAttack.Enable", false);
-        sLog.outInfo("TwowAutoAttack: adaptive attacks %s.", enabled ? "enabled" : "disabled");
-        if (enabled)
+        LoadRuntimeConfig();
+        bool const isEnabled = sConfig.GetBoolDefault("TwowAutoAttack.Enable", false);
+        enabled.store(isEnabled, std::memory_order_release);
+        sLog.outInfo("TwowAutoAttack: adaptive attacks %s.", isEnabled ? "enabled" : "disabled");
+        if (isEnabled)
         {
-            std::unique_ptr<QueryResult> table(CharacterDatabase.PQuery(
-                "SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() "
-                "AND TABLE_NAME = 'mod_twow_autoattack_ranged_disabled'"));
-            preferencesAvailable = bool(table);
-            std::unique_ptr<QueryResult> meleeTable(CharacterDatabase.PQuery(
-                "SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() "
-                "AND TABLE_NAME = 'mod_twow_autoattack_melee_preference'"));
-            meleePreferencesAvailable = bool(meleeTable);
+            bool hasRangedTable = false;
+            bool hasMeleeTable = false;
+            std::unique_ptr<QueryResult> tables(CharacterDatabase.PQuery(
+                "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() "
+                "AND TABLE_NAME IN ('mod_twow_autoattack_ranged_disabled', 'mod_twow_autoattack_melee_preference')"));
+            if (tables)
+            {
+                do
+                {
+                    char const* tableName = tables->Fetch()[0].GetString();
+                    if (tableName && std::strcmp(tableName, "mod_twow_autoattack_ranged_disabled") == 0)
+                        hasRangedTable = true;
+                    else if (tableName && std::strcmp(tableName, "mod_twow_autoattack_melee_preference") == 0)
+                        hasMeleeTable = true;
+                } while (tables->NextRow());
+            }
+
+            preferencesAvailable.store(hasRangedTable, std::memory_order_release);
+            meleePreferencesAvailable.store(hasMeleeTable, std::memory_order_release);
+
+            if (hasRangedTable)
+            {
+                std::unique_ptr<QueryResult> rows(CharacterDatabase.PQuery(
+                    "SELECT guid FROM mod_twow_autoattack_ranged_disabled"));
+                if (rows)
+                {
+                    do
+                    {
+                        uint32 const guid = rows->Fetch()[0].GetUInt32();
+                        Shard& shard = ShardFor(guid);
+                        std::lock_guard<std::mutex> lock(shard.mutex);
+                        shard.rangedDisabled.insert(guid);
+                    } while (rows->NextRow());
+                }
+            }
+
+            if (hasMeleeTable)
+            {
+                std::unique_ptr<QueryResult> rows(CharacterDatabase.PQuery(
+                    "SELECT guid, prefer_melee FROM mod_twow_autoattack_melee_preference"));
+                if (rows)
+                {
+                    do
+                    {
+                        Field* fields = rows->Fetch();
+                        uint32 const guid = fields[0].GetUInt32();
+                        bool const prefer = fields[1].GetUInt32() != 0;
+                        Shard& shard = ShardFor(guid);
+                        std::lock_guard<std::mutex> lock(shard.mutex);
+                        shard.meleePreferences[guid] = prefer;
+                    } while (rows->NextRow());
+                }
+            }
         }
     }
 };
@@ -337,15 +576,13 @@ public:
 
     bool CanExecuteCommand(ChatHandler* handler, char const* command, char const* arguments) override
     {
-        if (!handler || !command)
-            return true;
-        std::string const name = Lowercase(command);
-        if (name != "aaf" && name != "rangedauto")
+        if (!handler || !command ||
+            (!EqualsIgnoreCase(command, "aaf") && !EqualsIgnoreCase(command, "rangedauto")))
             return true;
 
         WorldSession* session = handler->GetSession();
         Player* player = session ? session->GetPlayer() : nullptr;
-        if (!player || session->IsHeadless() || !enabled)
+        if (!player || session->IsHeadless() || !enabled.load(std::memory_order_relaxed))
         {
             handler->SendSysMessage("Auto-Attack Forever is unavailable.");
             return false;
@@ -358,8 +595,16 @@ public:
         section = Lowercase(section);
         if (section.empty() || (section == "status" && !(input >> extra)))
         {
-            handler->SendSysMessage(RangedEnabled(guid) ? "AAF_RANGED 1" : "AAF_RANGED 0");
-            handler->SendSysMessage(PreferMelee(guid) ? "AAF_MELEE 1" : "AAF_MELEE 0");
+            bool ranged = true;
+            bool preferMelee = defaultPreferMelee;
+            {
+                Shard& shard = ShardFor(guid);
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                ranged = RangedEnabledLocked(shard, guid);
+                preferMelee = PreferMeleeLocked(shard, guid);
+            }
+            handler->SendSysMessage(ranged ? "AAF_RANGED 1" : "AAF_RANGED 0");
+            handler->SendSysMessage(preferMelee ? "AAF_MELEE 1" : "AAF_MELEE 0");
             return false;
         }
 
@@ -376,7 +621,7 @@ public:
         {
             if (action != "status")
             {
-                if (!meleePreferencesAvailable)
+                if (!meleePreferencesAvailable.load(std::memory_order_relaxed))
                 {
                     handler->SendSysMessage("Auto-Attack Forever melee preferences are unavailable.");
                     return false;
@@ -389,8 +634,9 @@ public:
                     handler->SendSysMessage("Auto-Attack Forever could not save the melee preference.");
                     return false;
                 }
-                std::lock_guard<std::mutex> lock(intentsMutex);
-                meleePreferences[guid] = prefer;
+                Shard& shard = ShardFor(guid);
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                shard.meleePreferences[guid] = prefer;
             }
             handler->SendSysMessage(PreferMelee(guid) ? "AAF_MELEE 1" : "AAF_MELEE 0");
             return false;
@@ -398,7 +644,7 @@ public:
 
         if (action != "status")
         {
-            if (!preferencesAvailable)
+            if (!preferencesAvailable.load(std::memory_order_relaxed))
             {
                 handler->SendSysMessage("Auto-Attack Forever ranged preferences are unavailable.");
                 return false;
@@ -430,10 +676,11 @@ public:
 
     bool CanPacketReceive(WorldSession* session, WorldPacket const& incoming) override
     {
-        if (!enabled || !session)
+        if (!enabled.load(std::memory_order_relaxed) || !session)
             return true;
 
-        switch (incoming.GetOpcode())
+        uint16 const opcode = incoming.GetOpcode();
+        switch (opcode)
         {
             case CMSG_ATTACKSWING:
             case CMSG_ATTACKSTOP:
@@ -441,6 +688,7 @@ public:
             case CMSG_CAST_SPELL:
             case CMSG_CANCEL_CAST:
             case CMSG_SET_SELECTION:
+            case CMSG_SETSHEATHED:
                 break;
             default:
                 return true;
@@ -450,19 +698,71 @@ public:
         if (!player || !player->IsInWorld() || session->IsHeadless())
             return true;
 
-        if (incoming.GetOpcode() == CMSG_ATTACKSTOP)
+        uint32 const playerGuid = player->GetGUIDLow();
+
+        if (opcode == CMSG_ATTACKSTOP)
         {
             Forget(player, true, "attack stopped by client");
             return true;
         }
 
-        if (incoming.GetOpcode() == CMSG_CANCEL_AUTO_REPEAT_SPELL)
+        if (opcode == CMSG_SETSHEATHED)
         {
+            if (!HasAnyActiveIntent())
+                return true;
+
+            uint32 sheathed = 0;
+            if (!PeekPacketValue(incoming, sheathed) || sheathed != SHEATH_STATE_MELEE)
+                return true;
+
+            Shard& shard = ShardFor(playerGuid);
+            if (!ShardHasActiveIntent(shard))
+                return true;
+
+            Intent intent;
+            bool rangedEnabled = true;
+            bool preferMelee = defaultPreferMelee.load(std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                auto const found = shard.intents.find(playerGuid);
+                if (found == shard.intents.end())
+                    return true;
+                intent = found->second;
+                rangedEnabled = RangedEnabledLocked(shard, playerGuid);
+                preferMelee = PreferMeleeLocked(shard, playerGuid);
+            }
+
+            bool const accepted = intent.pending && AcceptedShot(player, *intent.pending);
+            bool const managedRanged = intent.ranged || accepted;
+            if (!managedRanged || !rangedEnabled || player->HasUnitState(UNIT_STAT_MELEE_ATTACKING))
+                return true;
+
+            ObjectGuid const targetGuid = accepted ? intent.pending->target : intent.target;
+            Unit* target = targetGuid.IsUnit() ? player->GetMap()->GetUnit(targetGuid) : nullptr;
+            if (!ValidTarget(player, target) || !DesiredShot(player, target, intent.shotId, preferMelee))
+                return true;
+
+            // Keep the ranged weapon held between ranged shots; the melee weapon
+            // is drawn only once the target enters melee range.
+            EnsureRangedSheath(player, true);
+            return false;
+        }
+
+        if (opcode == CMSG_CANCEL_AUTO_REPEAT_SPELL)
+        {
+            if (!HasAnyActiveIntent())
+                return true;
+
+            Shard& shard = ShardFor(playerGuid);
+            if (!ShardHasActiveIntent(shard))
+                return true;
+
+            Intent removed;
             bool cancelOwnedRepeat = false;
             {
-                std::lock_guard<std::mutex> lock(intentsMutex);
-                auto const found = intents.find(player->GetGUIDLow());
-                if (found != intents.end())
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                auto const found = shard.intents.find(playerGuid);
+                if (found != shard.intents.end())
                 {
                     Intent const& intent = found->second;
                     cancelOwnedRepeat = (intent.slot == CURRENT_AUTOREPEAT_SPELL &&
@@ -470,25 +770,41 @@ public:
                             (intent.shotId == WandShoot && intent.ranged && !intent.transition && !intent.pending))) ||
                         (intent.pending && intent.pending->slot == CURRENT_AUTOREPEAT_SPELL &&
                             AcceptedShot(player, *intent.pending));
+                    if (cancelOwnedRepeat)
+                    {
+                        removed = intent;
+                        shard.intents.erase(found);
+                        shard.intentCount.fetch_sub(1, std::memory_order_release);
+                        totalActiveIntents.fetch_sub(1, std::memory_order_release);
+                    }
                 }
             }
             if (cancelOwnedRepeat)
-                Forget(player, false, "ranged repeat cancelled by client", true);
+                CleanupForgottenIntent(player, removed, false, "ranged repeat cancelled by client", true);
             // A late cancel with an empty repeat slot cannot stop a new intent
             // or an independently timed Shoot/Throw cast.
             return true;
         }
 
-        WorldPacket packet(incoming);
-        if (incoming.GetOpcode() == CMSG_SET_SELECTION)
+        if (opcode == CMSG_SET_SELECTION)
         {
-            ObjectGuid selection;
-            packet >> selection;
+            if (!HasAnyActiveIntent())
+                return true;
+
+            Shard& shard = ShardFor(playerGuid);
+            if (!ShardHasActiveIntent(shard))
+                return true;
+
+            uint64 rawSelection = 0;
+            if (!PeekPacketValue(incoming, rawSelection))
+                return true;
+            ObjectGuid const selection(rawSelection);
+
             Intent intent;
             {
-                std::lock_guard<std::mutex> lock(intentsMutex);
-                auto const found = intents.find(player->GetGUIDLow());
-                if (found == intents.end())
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                auto const found = shard.intents.find(playerGuid);
+                if (found == shard.intents.end())
                     return true;
                 intent = found->second;
             }
@@ -526,44 +842,78 @@ public:
                         intent.pending->target = selection;
                     else
                         intent.target = selection;
-                    std::lock_guard<std::mutex> lock(intentsMutex);
-                    intents.insert_or_assign(player->GetGUIDLow(), intent);
+                    std::lock_guard<std::mutex> lock(shard.mutex);
+                    UpsertIntentLocked(shard, playerGuid, intent);
                 }
             }
             return true;
         }
 
-        if (incoming.GetOpcode() != CMSG_ATTACKSWING)
+        if (opcode == CMSG_CANCEL_CAST)
         {
-            uint32 spellId;
-            packet >> spellId;
-            if (incoming.GetOpcode() == CMSG_CANCEL_CAST)
+            if (!HasAnyActiveIntent())
+                return true;
+
+            Shard& shard = ShardFor(playerGuid);
+            if (!ShardHasActiveIntent(shard))
+                return true;
+
+            uint32 spellId = 0;
+            if (!PeekPacketValue(incoming, spellId))
+                return true;
+
+            Intent removed;
+            bool cancel = false;
             {
-                bool cancel = false;
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                auto const found = shard.intents.find(playerGuid);
+                if (found != shard.intents.end())
                 {
-                    std::lock_guard<std::mutex> lock(intentsMutex);
-                    auto const found = intents.find(player->GetGUIDLow());
-                    if (found != intents.end())
+                    Intent const& intent = found->second;
+                    cancel = ((!spellId || spellId == intent.shotId) && OwnedShot(player, intent)) ||
+                        (intent.pending && (!spellId || spellId == intent.pending->spellId) &&
+                            AcceptedShot(player, *intent.pending));
+                    if (cancel)
                     {
-                        Intent const& intent = found->second;
-                        cancel = ((!spellId || spellId == intent.shotId) && OwnedShot(player, intent)) ||
-                            (intent.pending && (!spellId || spellId == intent.pending->spellId) &&
-                                AcceptedShot(player, *intent.pending));
+                        removed = intent;
+                        shard.intents.erase(found);
+                        shard.intentCount.fetch_sub(1, std::memory_order_release);
+                        totalActiveIntents.fetch_sub(1, std::memory_order_release);
                     }
                 }
-                if (cancel)
-                    Forget(player, false, "ranged cast cancelled by client", true);
-                return true;
             }
+            if (cancel)
+                CleanupForgottenIntent(player, removed, false, "ranged cast cancelled by client", true);
+            return true;
+        }
 
-            if (!Eligible(player) || !spellId || spellId != WeaponShot(player, spellId) ||
-                !RangedEnabled(player->GetGUIDLow()))
+        if (opcode == CMSG_CAST_SPELL)
+        {
+            uint32 spellId = 0;
+            if (!PeekPacketValue(incoming, spellId) || !IsSupportedShotSpell(spellId))
+                return true;
+
+            if (!Eligible(player) || spellId != WeaponShot(player, spellId))
                 return true;
 
             SpellEntry const* spell = sSpellMgr.GetSpellEntry(spellId);
             if (!spell || spell->IsPassiveSpell())
                 return true;
 
+            Shard& shard = ShardFor(playerGuid);
+            Intent intent;
+            {
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                if (!RangedEnabledLocked(shard, playerGuid))
+                    return true;
+                auto const found = shard.intents.find(playerGuid);
+                if (found != shard.intents.end())
+                    intent = found->second;
+            }
+
+            WorldPacket packet(incoming);
+            uint32 skippedSpellId = 0;
+            packet >> skippedSpellId;
             SpellCastTargets targets;
             packet >> targets.ReadForCaster(player);
             Unit* target = targets.getUnitTarget();
@@ -572,26 +922,22 @@ public:
 
             CurrentSpellTypes const slot = spell->IsAutoRepeatRangedSpell()
                 ? CURRENT_AUTOREPEAT_SPELL : CURRENT_GENERIC_SPELL;
-            uint32 const guid = player->GetGUIDLow();
-            Intent intent;
-            {
-                std::lock_guard<std::mutex> lock(intentsMutex);
-                auto const found = intents.find(guid);
-                if (found != intents.end())
-                    intent = found->second;
-            }
             AdoptPendingShot(player, intent);
             intent.pending = PendingShot{target->GetObjectGuid(), player->GetCurrentSpell(slot), spellId, slot};
-            std::lock_guard<std::mutex> lock(intentsMutex);
-            intents.insert_or_assign(guid, intent);
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            UpsertIntentLocked(shard, playerGuid, intent);
             return true;
         }
 
+        // CMSG_ATTACKSWING
         if (!Eligible(player))
             return true;
 
-        ObjectGuid guid;
-        packet >> guid;
+        uint64 rawGuid = 0;
+        if (!PeekPacketValue(incoming, rawGuid))
+            return true;
+        ObjectGuid const guid(rawGuid);
+
         Unit* target = guid.IsUnit() ? player->GetMap()->GetUnit(guid) : nullptr;
         if (!ValidTarget(player, target) || player->IsFriendlyTo(target))
             return true;
@@ -602,20 +948,31 @@ public:
             return true;
         }
 
-        uint32 const playerGuid = player->GetGUIDLow();
-        uint32 const directShot = RangedEnabled(playerGuid)
-            ? DesiredShot(player, target, 0, PreferMelee(playerGuid)) : 0;
+        Shard& shard = ShardFor(playerGuid);
+        bool rangedEnabled = true;
+        bool preferMelee = defaultPreferMelee;
+        bool hasExisting = false;
+        Intent existing;
         {
-            std::lock_guard<std::mutex> lock(intentsMutex);
-            auto const found = intents.find(playerGuid);
-            if (found != intents.end())
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            rangedEnabled = RangedEnabledLocked(shard, playerGuid);
+            preferMelee = PreferMeleeLocked(shard, playerGuid);
+            auto const found = shard.intents.find(playerGuid);
+            if (found != shard.intents.end())
             {
-                Intent const& intent = found->second;
-                if (intent.pending && intent.pending->target == guid && AcceptedShot(player, *intent.pending))
-                    return !directShot;
-                if (intent.target == guid && player->GetVictim() == target)
-                    return !directShot;
+                hasExisting = true;
+                existing = found->second;
             }
+        }
+
+        uint32 const directShot = rangedEnabled
+            ? DesiredShot(player, target, 0, preferMelee) : 0;
+        if (hasExisting)
+        {
+            if (existing.pending && existing.pending->target == guid && AcceptedShot(player, *existing.pending))
+                return !directShot;
+            if (existing.target == guid && player->GetVictim() == target)
+                return !directShot;
         }
 
         Intent intent{guid};
@@ -627,14 +984,29 @@ public:
             if (player->GetVictim() != target)
                 return true;
             intent.ranged = true;
+            EnsureRangedSheath(player, true);
             Trace(player, guid, "ranged-first attack", directShot);
         }
+        else if (player->GetSheath() == SHEATH_STATE_RANGED)
+            EnsureMeleeSheath(player, true);
 
-        Forget(player, true, "attack target changed");
+        Intent previous;
+        bool hadPrevious = false;
         {
-            std::lock_guard<std::mutex> lock(intentsMutex);
-            intents.emplace(playerGuid, intent);
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            auto const found = shard.intents.find(playerGuid);
+            if (found != shard.intents.end())
+            {
+                hadPrevious = true;
+                previous = found->second;
+                found->second = intent;
+            }
+            else
+                UpsertIntentLocked(shard, playerGuid, intent);
         }
+        if (hadPrevious)
+            CleanupForgottenIntent(player, previous, true, "attack target changed", false);
+
         // Melee requests still go through the stock swing handler.
         return !directShot;
     }
@@ -649,77 +1021,95 @@ public:
 
     void OnLogin(Player* player) override
     {
-        if (!enabled || player->GetSession()->IsHeadless())
+        if (!enabled.load(std::memory_order_relaxed) || !player || !player->GetSession() ||
+            player->GetSession()->IsHeadless())
             return;
 
-        uint32 const guid = player->GetGUIDLow();
-        if (preferencesAvailable)
-        {
-            std::unique_ptr<QueryResult> row(CharacterDatabase.PQuery(
-                "SELECT guid FROM mod_twow_autoattack_ranged_disabled WHERE guid = %u", guid));
-            CacheRangedPreference(guid, !row);
-        }
-        if (meleePreferencesAvailable)
-        {
-            std::unique_ptr<QueryResult> row(CharacterDatabase.PQuery(
-                "SELECT prefer_melee FROM mod_twow_autoattack_melee_preference WHERE guid = %u", guid));
-            std::lock_guard<std::mutex> lock(intentsMutex);
-            if (row)
-                meleePreferences[guid] = row->Fetch()[0].GetUInt32() != 0;
-            else
-                meleePreferences.erase(guid);
-        }
         if (announce)
             ChatHandler(player).SendSysMessage("Auto-Attack Forever is enabled. Use .aaf status for your settings.");
     }
 
     void OnLogout(Player* player) override
     {
+        if (!enabled.load(std::memory_order_relaxed) || !player || !player->GetSession() ||
+            player->GetSession()->IsHeadless())
+            return;
         Forget(player, false, "logout");
-        std::lock_guard<std::mutex> lock(intentsMutex);
-        rangedDisabled.erase(player->GetGUIDLow());
-        meleePreferences.erase(player->GetGUIDLow());
     }
-    void OnMapChanged(Player* player) override { Forget(player, false, "map changed"); }
-    void OnPlayerJustDied(Player* player) override { Forget(player, false, "player died"); }
+
+    void OnMapChanged(Player* player) override
+    {
+        if (!enabled.load(std::memory_order_relaxed) || !player || !player->GetSession() ||
+            player->GetSession()->IsHeadless())
+            return;
+        Forget(player, false, "map changed");
+    }
+
+    void OnPlayerJustDied(Player* player) override
+    {
+        if (!enabled.load(std::memory_order_relaxed) || !player || !player->GetSession() ||
+            player->GetSession()->IsHeadless())
+            return;
+        Forget(player, false, "player died");
+    }
 
     void OnSpellCast(Player* player, Spell* spell, bool /*skipCheck*/) override
     {
-        if (!enabled || !IsPacedShot(spell->m_spellInfo->Id) || spell->IsAutoRepeat() ||
+        if (!enabled.load(std::memory_order_relaxed) || !HasAnyActiveIntent() ||
+            !IsPacedShot(spell->m_spellInfo->Id) || spell->IsAutoRepeat() ||
             spell->IsTriggered() || !player->GetSession() ||
             player->GetSession()->IsHeadless())
             return;
 
+        uint32 const guid = player->GetGUIDLow();
+        Shard& shard = ShardFor(guid);
+        if (!ShardHasActiveIntent(shard))
+            return;
+
         bool paced = false;
+        bool stillRanged = false;
         {
-            std::lock_guard<std::mutex> lock(intentsMutex);
-            auto const found = intents.find(player->GetGUIDLow());
-            if (found != intents.end())
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            auto const found = shard.intents.find(guid);
+            if (found != shard.intents.end())
+            {
                 paced = found->second.slot == CURRENT_GENERIC_SPELL && OwnedShot(player, found->second) == spell;
+                stillRanged = found->second.ranged;
+            }
         }
         if (paced)
+        {
             player->ResetAttackTimer(RANGED_ATTACK);
+            if (stillRanged && !player->HasUnitState(UNIT_STAT_MELEE_ATTACKING))
+                EnsureRangedSheath(player);
+        }
     }
 
     void OnBeforeUpdate(Player* player, uint32 diff) override
     {
-        if (!enabled || !player->GetSession() || player->GetSession()->IsHeadless())
+        if (!enabled.load(std::memory_order_relaxed) || !HasAnyActiveIntent() ||
+            !player->GetSession() || player->GetSession()->IsHeadless())
             return;
 
         uint32 const guid = player->GetGUIDLow();
+        Shard& shard = ShardFor(guid);
+        if (!ShardHasActiveIntent(shard))
+            return;
+
         Intent intent;
-        bool ranged;
-        bool preferMelee;
+        bool ranged = true;
+        bool preferMelee = defaultPreferMelee;
         {
-            std::lock_guard<std::mutex> lock(intentsMutex);
-            auto const found = intents.find(guid);
-            if (found == intents.end())
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            auto const found = shard.intents.find(guid);
+            if (found == shard.intents.end())
                 return;
             intent = found->second;
-            ranged = rangedDisabled.count(guid) == 0;
-            auto const preference = meleePreferences.find(guid);
-            preferMelee = preference == meleePreferences.end() ? defaultPreferMelee : preference->second;
+            ranged = RangedEnabledLocked(shard, guid);
+            preferMelee = PreferMeleeLocked(shard, guid);
         }
+
+        Intent const initial = intent;
 
         if (!Eligible(player))
         {
@@ -731,9 +1121,9 @@ public:
         {
             AdoptPendingShot(player, intent);
             {
-                std::lock_guard<std::mutex> lock(intentsMutex);
-                auto const found = intents.find(guid);
-                if (found == intents.end())
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                auto const found = shard.intents.find(guid);
+                if (found == shard.intents.end())
                     return;
                 found->second = intent;
             }
@@ -754,6 +1144,12 @@ public:
 
         intent.retry = diff >= intent.retry ? 0 : intent.retry - diff;
         intent.transition = diff >= intent.transition ? 0 : intent.transition - diff;
+        if (intent.retry && intent.hasFailPos && MovedSinceFailure(player, target, intent))
+        {
+            intent.retry = 0;
+            intent.hasFailPos = false;
+        }
+
         Spell* current = player->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL);
         Spell* owned = OwnedShot(player, intent);
         if (current && current != owned)
@@ -776,22 +1172,32 @@ public:
         {
             if (intent.ranged)
             {
+                EnsureMeleeSheath(player, true);
                 player->Attack(target, true);
                 Trace(player, intent.target, "switched to melee");
             }
+            else if (player->HasUnitState(UNIT_STAT_MELEE_ATTACKING) &&
+                player->GetSheath() == SHEATH_STATE_RANGED)
+                EnsureMeleeSheath(player, true);
             intent.ranged = false;
             intent.retry = 0;
             intent.lastFailure = SPELL_CAST_OK;
+            intent.hasFailPos = false;
         }
         else
         {
+            bool const wasRanged = intent.ranged;
             intent.ranged = true;
             if (player->HasUnitState(UNIT_STAT_MELEE_ATTACKING))
             {
                 player->ClearUnitState(UNIT_STAT_MELEE_ATTACKING);
                 player->SendMeleeAttackStop(target);
+                EnsureRangedSheath(player, true);
                 Trace(player, intent.target, "switched to ranged", desired);
             }
+            else
+                EnsureRangedSheath(player, !wasRanged);
+
             // Auto Shot can be armed while moving. The core pauses it until
             // stationary, while wand Shoot would be cancelled each update.
             if (!owned && !intent.retry && !intent.transition &&
@@ -811,11 +1217,19 @@ public:
                     {
                         if (geometry != intent.lastFailure)
                             Trace(player, intent.target, "ranged shot waiting", desired, uint32(geometry));
+                        intent.retry = geometry == intent.lastFailure ? RetryMs : TransientRetryMs;
                         intent.lastFailure = geometry;
-                        intent.retry = TransientRetryMs;
+                        intent.hasFailPos = true;
+                        intent.failPlayerX = player->GetPositionX();
+                        intent.failPlayerY = player->GetPositionY();
+                        intent.failPlayerZ = player->GetPositionZ();
+                        intent.failTargetX = target->GetPositionX();
+                        intent.failTargetY = target->GetPositionY();
+                        intent.failTargetZ = target->GetPositionZ();
                     }
                     else
                     {
+                        intent.hasFailPos = false;
                         CurrentSpellTypes const slot = info->IsAutoRepeatRangedSpell()
                             ? CURRENT_AUTOREPEAT_SPELL : CURRENT_GENERIC_SPELL;
                         SpellCastTargets targets;
@@ -846,10 +1260,13 @@ public:
             }
         }
 
-        std::lock_guard<std::mutex> lock(intentsMutex);
-        auto const found = intents.find(guid);
-        if (found != intents.end() && found->second.target == intent.target)
-            found->second = intent;
+        if (intent != initial)
+        {
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            auto const found = shard.intents.find(guid);
+            if (found != shard.intents.end() && found->second.target == intent.target)
+                found->second = intent;
+        }
     }
 };
 
@@ -860,6 +1277,9 @@ public:
 
     void OnPlayerLeaveAll(Map* /*map*/, Player* player) override
     {
+        if (!enabled.load(std::memory_order_relaxed) || !player || !player->GetSession() ||
+            player->GetSession()->IsHeadless())
+            return;
         Forget(player, true, "left map", true);
     }
 };

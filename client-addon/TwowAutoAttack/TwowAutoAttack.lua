@@ -13,8 +13,14 @@ button:RegisterForDrag("RightButton")
 button:SetNormalTexture(defaultTexture)
 button:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
 
+local currentTexture = defaultTexture
+
 local function updateIcon()
-    button:SetNormalTexture(GetInventoryItemTexture("player", rangedSlot) or defaultTexture)
+    local texture = GetInventoryItemTexture("player", rangedSlot) or defaultTexture
+    if texture ~= currentTexture then
+        currentTexture = texture
+        button:SetNormalTexture(texture)
+    end
 end
 
 local function setButtonPosition(x, y)
@@ -36,7 +42,11 @@ button:SetScript("OnDragStop", function()
     if not x or not y or not parentX or not parentY then
         return
     end
-    TwowAutoAttackPosition = { x - parentX, y - parentY }
+    if type(TwowAutoAttackPosition) ~= "table" then
+        TwowAutoAttackPosition = {}
+    end
+    TwowAutoAttackPosition[1] = x - parentX
+    TwowAutoAttackPosition[2] = y - parentY
     setButtonPosition(TwowAutoAttackPosition[1], TwowAutoAttackPosition[2])
 end)
 
