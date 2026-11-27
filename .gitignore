@@ -1,0 +1,15 @@
+AGENTS.md
+.agents/
+.orchestration/
+tests/
+t/
+test_*
+docs/
+build/
+bin/
+.vs/
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+*.log

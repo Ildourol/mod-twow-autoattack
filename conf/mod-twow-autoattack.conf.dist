@@ -1,24 +1,111 @@
+###################################################################################################
+# AUTO-ATTACK FOREVER (mod-twow-autoattack) CONFIGURATION
+#
+# Adaptive melee and learned native ranged auto-attack for TortoiseWoW / Turtle WoW (1.18.1.7272).
+# Based on Auto-Attack-Forever-wotlk (SPDX-License-Identifier: GPL-2.0-or-later).
+#
+# Install:
+#   Copy this file to Server/etc/modules/mod-twow-autoattack.conf
+#
+# Player Commands (requires character SQL tables):
+#   .aaf status                    - Show current ranged and close-range melee preferences.
+#   .aaf ranged on|off|status      - Enable or disable adaptive ranged attacks for your character.
+#   .aaf melee  on|off|status      - Prefer melee vs. ranged when inside melee reach.
+#
+# Notes:
+#   - Headless TortoiseBots sessions are automatically excluded.
+#   - TwowAutoAttack.Enable requires a full server restart to change.
+#   - All other settings support live reload via `.reload config`.
+###################################################################################################
+
 [TwowAutoAttack]
 
-# Enable adaptive melee and learned native ranged attacks. Restart to change.
+###################################################################################################
+# GENERAL SETTINGS
+###################################################################################################
+
+#
+#    TwowAutoAttack.Enable
+#        Description: Enable or disable adaptive melee and learned native ranged attacks globally.
+#                     Requires a full worldserver restart to take effect (also preloads per-player
+#                     preference tables at startup).
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+
 TwowAutoAttack.Enable = 1
 
+#
+#    TwowAutoAttack.Announce
+#        Description: Send a short login notice to eligible (non-bot) players informing them that
+#                     Auto-Attack Forever is enabled and how to check `.aaf status`.
+#                     Supports `.reload config`.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
 
-# Log mode changes, stop reasons and native cast result codes. Set a positive
-# character GUID to trace only that character. Zero traces all eligible players.
-TwowAutoAttack.Debug = 0
-TwowAutoAttack.Debug.PlayerGuid = 0
+TwowAutoAttack.Announce = 0
 
-# Start adaptive combat from the vanilla Attack action or hostile right-click.
-# Learned native ranged actions can still start adaptive combat when set to 0.
+###################################################################################################
+# COMBAT BEHAVIOR SETTINGS
+###################################################################################################
+
+#
+#    TwowAutoAttack.RightClick
+#        Description: Allow the vanilla Attack action or right-clicking a hostile target to start
+#                     adaptive ranged/melee combat automatically.
+#                     When set to 0, right-clicking uses stock melee behavior only, while learned
+#                     native ranged actions (Auto Shot, Shoot, Throw, Wand) still start adaptive
+#                     combat.
+#                     Supports `.reload config`.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+
 TwowAutoAttack.RightClick = 1
 
-# Prefer melee in close range. A character can override this with .aaf melee.
-# Native ranged minimum distances apply even when melee preference is off.
+#
+#    TwowAutoAttack.CloseRange.Melee
+#        Description: Default close-range behavior when a target is inside melee reach.
+#                     Individual characters can override this with `.aaf melee on|off` (saved in
+#                     `mod_twow_autoattack_melee_preference`).
+#                     Native ranged minimum distances (e.g., hunter deadzone / bow & gun min range)
+#                     still switch to melee even when melee preference is off.
+#                     Supports `.reload config`.
+#        Default:     1 - (Prefer melee in close range)
+#                     0 - (Keep using ranged if allowed by weapon min range)
+
 TwowAutoAttack.CloseRange.Melee = 1
 
-# End a module-managed ranged attack when its selected target changes or clears.
+#
+#    TwowAutoAttack.StopOnTargetChange
+#        Description: Automatically cancel a module-managed ranged attack when the player clears
+#                     or switches their selected target.
+#                     When set to 0, native auto-repeat ranged shots (Auto Shot / Wand) can
+#                     retarget to a newly selected valid hostile unit.
+#                     Supports `.reload config`.
+#        Default:     1 - (Stop ranged attack on target change/clear)
+#                     0 - (Allow retargeting on valid hostile selection)
+
 TwowAutoAttack.StopOnTargetChange = 1
 
-# Tell eligible players about the module at login.
-TwowAutoAttack.Announce = 0
+###################################################################################################
+# DEBUGGING & DIAGNOSTICS
+###################################################################################################
+
+#
+#    TwowAutoAttack.Debug
+#        Description: Log adaptive combat mode transitions, stop reasons, and native ranged cast
+#                     result codes to the server info log.
+#                     Supports `.reload config`.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
+
+TwowAutoAttack.Debug = 0
+
+#
+#    TwowAutoAttack.Debug.PlayerGuid
+#        Description: Character low GUID filter for TwowAutoAttack.Debug trace logs.
+#                     Set a positive character GUID to trace only that character, or 0 to trace
+#                     all eligible players when TwowAutoAttack.Debug = 1.
+#                     Supports `.reload config`.
+#        Default:     0 - (All eligible players)
+
+TwowAutoAttack.Debug.PlayerGuid = 0
