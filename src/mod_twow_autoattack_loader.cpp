@@ -40,6 +40,8 @@ constexpr uint32 Throw = 2764;
 constexpr uint32 RetryMs = 500;
 constexpr uint32 TransientRetryMs = 125;
 constexpr uint32 TransitionMs = 100;
+constexpr uint32 PacedShotAnimMs = 850;
+constexpr uint32 ReadyPoseMinRemainingMs = 400;
 constexpr size_t ShardCount = 32;
 constexpr float MoveResetDistSq = 0.09f; // 0.3 yd movement invalidates geometry backoff
 
@@ -65,9 +67,10 @@ struct Intent
     CurrentSpellTypes slot = CURRENT_AUTOREPEAT_SPELL;
     uint32 retry = 0;
     uint32 transition = 0;
-    uint32 activeEmote = 0;
+    uint32 shotAnim = 0;
     SpellCastResult lastFailure = SPELL_CAST_OK;
     bool ranged = false;
+    bool readyEmoteSent = false;
     bool hasFailPos = false;
     float failPlayerX = 0.0f;
     float failPlayerY = 0.0f;
@@ -81,8 +84,9 @@ struct Intent
     {
         return target == other.target && shot == other.shot && shotId == other.shotId &&
             slot == other.slot && retry == other.retry && transition == other.transition &&
-            activeEmote == other.activeEmote && lastFailure == other.lastFailure &&
-            ranged == other.ranged && hasFailPos == other.hasFailPos &&
+            shotAnim == other.shotAnim && lastFailure == other.lastFailure &&
+            ranged == other.ranged && readyEmoteSent == other.readyEmoteSent &&
+            hasFailPos == other.hasFailPos &&
             (!hasFailPos || (failPlayerX == other.failPlayerX && failPlayerY == other.failPlayerY &&
                 failPlayerZ == other.failPlayerZ && failTargetX == other.failTargetX &&
                 failTargetY == other.failTargetY && failTargetZ == other.failTargetZ)) &&
@@ -211,7 +215,7 @@ void EnsureMeleeSheath(Player* player, bool immediate = false)
         player->DirectSendPublicValueUpdate({UNIT_FIELD_BYTES_2});
 }
 
-uint32 RangedReadyEmote(Player* player)
+uint32 RangedReadyOneShotEmote(Player* player)
 {
     Item* weapon = player->GetWeaponForAttack(RANGED_ATTACK, true, true);
     if (!weapon)
@@ -220,42 +224,13 @@ uint32 RangedReadyEmote(Player* player)
     switch (weapon->GetProto()->SubClass)
     {
         case ITEM_SUBCLASS_WEAPON_BOW:
-            return EMOTE_STATE_HOLD_BOW;
+            return EMOTE_ONESHOT_READYBOW;
         case ITEM_SUBCLASS_WEAPON_GUN:
         case ITEM_SUBCLASS_WEAPON_CROSSBOW:
-            return EMOTE_STATE_HOLD_RIFLE;
-        case ITEM_SUBCLASS_WEAPON_THROWN:
-            return EMOTE_STATE_HOLD_THROWN;
+            return EMOTE_ONESHOT_READYRIFLE;
         default:
             return 0;
     }
-}
-
-void ClearRangedEmote(Player* player, uint32& activeEmote, bool immediate = false)
-{
-    if (!activeEmote)
-        return;
-    if (player->IsInWorld() && player->GetUInt32Value(UNIT_NPC_EMOTESTATE) == activeEmote)
-    {
-        player->HandleEmoteState(0);
-        if (immediate)
-            player->DirectSendPublicValueUpdate({UNIT_NPC_EMOTESTATE});
-    }
-    activeEmote = 0;
-}
-
-void SetRangedEmote(Player* player, uint32& activeEmote, uint32 emote)
-{
-    if (!emote)
-    {
-        ClearRangedEmote(player, activeEmote, true);
-        return;
-    }
-    if (activeEmote == emote && player->GetUInt32Value(UNIT_NPC_EMOTESTATE) == emote)
-        return;
-    player->HandleEmoteState(emote);
-    player->DirectSendPublicValueUpdate({UNIT_NPC_EMOTESTATE});
-    activeEmote = emote;
 }
 
 void Trace(Player* player, ObjectGuid target, char const* event, uint32 spellId = 0, uint32 result = 0)
@@ -348,8 +323,6 @@ void StopRangedVictim(Player* player, ObjectGuid target)
 void CleanupForgottenIntent(Player* player, Intent const& intent, bool interrupt, char const* reason, bool stopRangedVictim)
 {
     Trace(player, intent.target, reason, intent.shotId);
-    uint32 activeEmote = intent.activeEmote;
-    ClearRangedEmote(player, activeEmote, true);
     if (interrupt && player->IsInWorld())
     {
         if (intent.pending && AcceptedShot(player, *intent.pending))
@@ -427,8 +400,9 @@ void AdoptPendingShot(Player* player, Intent& intent)
     intent.transition = 0;
     intent.lastFailure = SPELL_CAST_OK;
     intent.hasFailPos = false;
+    intent.shotAnim = 0;
+    intent.readyEmoteSent = false;
     intent.ranged = true;
-    ClearRangedEmote(player, intent.activeEmote, true);
     EnsureRangedSheath(player);
     Trace(player, intent.target, "native ranged cast adopted", intent.shotId);
 }
@@ -1135,6 +1109,11 @@ public:
             {
                 paced = found->second.slot == CURRENT_GENERIC_SPELL && OwnedShot(player, found->second) == spell;
                 stillRanged = found->second.ranged;
+                if (paced)
+                {
+                    found->second.shotAnim = PacedShotAnimMs;
+                    found->second.readyEmoteSent = false;
+                }
             }
         }
         if (paced)
@@ -1204,6 +1183,7 @@ public:
 
         intent.retry = diff >= intent.retry ? 0 : intent.retry - diff;
         intent.transition = diff >= intent.transition ? 0 : intent.transition - diff;
+        intent.shotAnim = diff >= intent.shotAnim ? 0 : intent.shotAnim - diff;
         if (intent.retry && intent.hasFailPos && MovedSinceFailure(player, target, intent))
         {
             intent.retry = 0;
@@ -1230,7 +1210,6 @@ public:
 
         if (!desired)
         {
-            ClearRangedEmote(player, intent.activeEmote, true);
             if (intent.ranged)
             {
                 EnsureMeleeSheath(player, true);
@@ -1242,6 +1221,8 @@ public:
                 EnsureMeleeSheath(player, true);
             intent.ranged = false;
             intent.retry = 0;
+            intent.shotAnim = 0;
+            intent.readyEmoteSent = false;
             intent.lastFailure = SPELL_CAST_OK;
             intent.hasFailPos = false;
         }
@@ -1291,8 +1272,6 @@ public:
                     else
                     {
                         intent.hasFailPos = false;
-                        if (!info->IsAutoRepeatRangedSpell())
-                            ClearRangedEmote(player, intent.activeEmote, true);
                         CurrentSpellTypes const slot = info->IsAutoRepeatRangedSpell()
                             ? CURRENT_AUTOREPEAT_SPELL : CURRENT_GENERIC_SPELL;
                         SpellCastTargets targets;
@@ -1323,17 +1302,18 @@ public:
                 }
             }
 
-            bool const canHoldRangedPose = player->GetSheath() == SHEATH_STATE_RANGED &&
+            if (IsPacedShot(desired) && !owned && !intent.shotAnim && !intent.readyEmoteSent &&
+                player->GetSheath() == SHEATH_STATE_RANGED &&
                 !player->IsMoving() &&
                 !player->IsNonMeleeSpellCasted(false, false, true) &&
                 player->GetStandState() == UNIT_STAND_STATE_STAND &&
                 !player->HasUnitState(UNIT_STAT_CAN_NOT_REACT) &&
-                ((IsPacedShot(desired) && !owned) ||
-                    (desired == AutoShot && (!owned || !owned->m_isClientStarted)));
-            if (canHoldRangedPose)
-                SetRangedEmote(player, intent.activeEmote, RangedReadyEmote(player));
-            else
-                ClearRangedEmote(player, intent.activeEmote, true);
+                player->GetAttackTimer(RANGED_ATTACK) > ReadyPoseMinRemainingMs)
+            {
+                if (uint32 const emote = RangedReadyOneShotEmote(player))
+                    player->HandleEmoteCommand(emote);
+                intent.readyEmoteSent = true;
+            }
         }
 
         if (intent != initial)
