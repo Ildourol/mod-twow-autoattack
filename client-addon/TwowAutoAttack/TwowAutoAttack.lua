@@ -17,6 +17,11 @@ local function updateIcon()
     button:SetNormalTexture(GetInventoryItemTexture("player", rangedSlot) or defaultTexture)
 end
 
+local function setButtonPosition(x, y)
+    button:ClearAllPoints()
+    button:SetPoint("CENTER", UIParent, "CENTER", x, y)
+end
+
 button:SetScript("OnClick", function()
     if UnitExists("target") and UnitCanAttack("player", "target") then
         AttackTarget()
@@ -28,9 +33,11 @@ button:SetScript("OnDragStop", function()
     this:StopMovingOrSizing()
     local x, y = this:GetCenter()
     local parentX, parentY = UIParent:GetCenter()
+    if not x or not y or not parentX or not parentY then
+        return
+    end
     TwowAutoAttackPosition = { x - parentX, y - parentY }
-    this:ClearAllPoints()
-    this:SetPoint("CENTER", UIParent, "CENTER", TwowAutoAttackPosition[1], TwowAutoAttackPosition[2])
+    setButtonPosition(TwowAutoAttackPosition[1], TwowAutoAttackPosition[2])
 end)
 
 button:SetScript("OnEnter", function()
@@ -46,9 +53,9 @@ button:RegisterEvent("PLAYER_LOGIN")
 button:RegisterEvent("UNIT_INVENTORY_CHANGED")
 button:SetScript("OnEvent", function()
     if event == "PLAYER_LOGIN" then
-        if TwowAutoAttackPosition then
-            this:ClearAllPoints()
-            this:SetPoint("CENTER", UIParent, "CENTER", TwowAutoAttackPosition[1], TwowAutoAttackPosition[2])
+        local position = TwowAutoAttackPosition
+        if type(position) == "table" and type(position[1]) == "number" and type(position[2]) == "number" then
+            setButtonPosition(position[1], position[2])
         end
         updateIcon()
     elseif arg1 == "player" then
