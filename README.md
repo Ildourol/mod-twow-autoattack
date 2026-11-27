@@ -1,7 +1,5 @@
 # Auto-Attack Forever
 
-![Fantasy adventurers and equipment around a campfire](readme-cover.png)
-
 Starts adaptive melee and ranged combat with the stock Attack action. It switches to a compatible ranged weapon when the target moves out of melee reach and switches back as the target closes. Native attacks still enforce weapon, ammunition, range and facing rules.
 
 ## Install
