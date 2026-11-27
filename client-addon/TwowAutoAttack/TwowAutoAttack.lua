@@ -1,0 +1,57 @@
+-- SPDX-License-Identifier: GPL-2.0-or-later
+
+local defaultTexture = "Interface\\Icons\\Ability_MeleeDamage"
+local rangedSlot = GetInventorySlotInfo("RangedSlot")
+local button = CreateFrame("Button", "TwowAutoAttackButton", UIParent)
+button:SetWidth(36)
+button:SetHeight(36)
+button:SetPoint("CENTER", UIParent, "CENTER", 0, -160)
+button:SetMovable(true)
+button:EnableMouse(true)
+button:RegisterForClicks("LeftButtonUp")
+button:RegisterForDrag("RightButton")
+button:SetNormalTexture(defaultTexture)
+button:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
+
+local function updateIcon()
+    button:SetNormalTexture(GetInventoryItemTexture("player", rangedSlot) or defaultTexture)
+end
+
+button:SetScript("OnClick", function()
+    if UnitExists("target") and UnitCanAttack("player", "target") then
+        AttackTarget()
+    end
+end)
+
+button:SetScript("OnDragStart", function() this:StartMoving() end)
+button:SetScript("OnDragStop", function()
+    this:StopMovingOrSizing()
+    local x, y = this:GetCenter()
+    local parentX, parentY = UIParent:GetCenter()
+    TwowAutoAttackPosition = { x - parentX, y - parentY }
+    this:ClearAllPoints()
+    this:SetPoint("CENTER", UIParent, "CENTER", TwowAutoAttackPosition[1], TwowAutoAttackPosition[2])
+end)
+
+button:SetScript("OnEnter", function()
+    GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+    GameTooltip:SetText("Adaptive Attack")
+    GameTooltip:AddLine("Left-click to use Attack on your target.", 1, 1, 1)
+    GameTooltip:AddLine("Right-drag to move.", 1, 1, 1)
+    GameTooltip:Show()
+end)
+button:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+button:RegisterEvent("PLAYER_LOGIN")
+button:RegisterEvent("UNIT_INVENTORY_CHANGED")
+button:SetScript("OnEvent", function()
+    if event == "PLAYER_LOGIN" then
+        if TwowAutoAttackPosition then
+            this:ClearAllPoints()
+            this:SetPoint("CENTER", UIParent, "CENTER", TwowAutoAttackPosition[1], TwowAutoAttackPosition[2])
+        end
+        updateIcon()
+    elseif arg1 == "player" then
+        updateIcon()
+    end
+end)

@@ -1,0 +1,24 @@
+[TwowAutoAttack]
+
+# Enable adaptive melee and learned native ranged attacks. Restart to change.
+TwowAutoAttack.Enable = 1
+
+
+# Log mode changes, stop reasons and native cast result codes. Set a positive
+# character GUID to trace only that character. Zero traces all eligible players.
+TwowAutoAttack.Debug = 0
+TwowAutoAttack.Debug.PlayerGuid = 0
+
+# Start adaptive combat from the vanilla Attack action or hostile right-click.
+# Learned native ranged actions can still start adaptive combat when set to 0.
+TwowAutoAttack.RightClick = 1
+
+# Prefer melee in close range. A character can override this with .aaf melee.
+# Native ranged minimum distances apply even when melee preference is off.
+TwowAutoAttack.CloseRange.Melee = 1
+
+# End a module-managed ranged attack when its selected target changes or clears.
+TwowAutoAttack.StopOnTargetChange = 1
+
+# Tell eligible players about the module at login.
+TwowAutoAttack.Announce = 0
